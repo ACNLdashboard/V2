@@ -133,6 +133,31 @@ def to_local(dt, tz_str):
     except Exception:
         return dt
 
+# Nederlandse luchthavens waar de CSV-datum op LOKALE tijd staat.
+NL_AIRPORTS = {"AMS", "EHAM", "EIN", "EHEH", "RTM", "EHRD"}
+
+def get_flight_match_date(f):
+    """Welke lokale datum hoort bij een vlucht voor matching met de CSV?
+
+    De CSV is opgesteld vanuit Amsterdams perspectief: voor inbound NL-vluchten
+    (bv. DL056 DTW-AMS) staat de vlucht onder de lokale AANKOMSTDATUM in AMS,
+    terwijl FlightAware diezelfde vlucht voert op basis van de vertrekdatum
+    (één kalenderdag eerder, lokaal in de VS). Daarom matchen we:
+      - bestemming = NL-luchthaven  -> lokale AANKOMSTDATUM (STA in dest-tz)
+      - anders                      -> lokale VERTREKDATUM (STD in origin-tz)
+    """
+    if not f: return None
+    dest = f.get('destination') or {}
+    origin = f.get('origin') or {}
+    dest_code = dest.get('code_iata') or dest.get('code_icao')
+    if dest_code in NL_AIRPORTS and f.get('scheduled_in'):
+        sta = pd.to_datetime(f.get('scheduled_in'))
+        return to_local(sta, dest.get('timezone')).date()
+    if f.get('scheduled_out'):
+        std = pd.to_datetime(f.get('scheduled_out'))
+        return to_local(std, origin.get('timezone')).date()
+    return None
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_unified_data(api_key, ident, start_dt, end_dt):
     target_ident = str(ident).replace(" ", "").strip().upper()
@@ -165,7 +190,7 @@ with col_title:
     st.title("Flight Operations Performance Insights")
 with col_logo:
     try:
-        st.image("logo-2-removebg-preview.png", use_container_width=True)
+        st.image("/Users/ennovankeulen/Desktop/Data analyse-ACNL/logo-2-removebg-preview.png", use_container_width=True)
     except:
         pass
 
@@ -200,19 +225,26 @@ if uploaded_file:
                 st.session_state['run_main'] = True
 
             if st.session_state.get('run_main') and fa_api_key:
-                # FIX: Verruim API venster naar +1 dag om landingen op de volgende dag op te vangen
-                target_flight_data = fetch_unified_data(fa_api_key, flight_number_clean, search_date, search_date + timedelta(days=1))
+                # FIX: Verruim API-venster naar -1 / +1 dag. Voor inbound NL-vluchten
+                # (bv. DL056 DTW-AMS) vertrekt het toestel lokaal in de VS één dag vóór
+                # de lokale AMS-aankomstdatum die in de CSV staat. Door ook search_date - 1
+                # mee te nemen vangen we deze vluchten op. +1 blijft voor landingen die
+                # over middernacht heen schuiven.
+                api_start = search_date - timedelta(days=1)
+                api_end = search_date + timedelta(days=1)
+                target_flight_data = fetch_unified_data(fa_api_key, flight_number_clean, api_start, api_end)
 
                 # FIX: Zoek het ECHTE toestel op dat de gevraagde vlucht uitvoerde, op basis van
                 # FlightAware. De CSV kan een verkeerde registratie bevatten (bv. DL056 staat in
                 # CSV als N806NW, maar werd in werkelijkheid door N419DX gevlogen). Anders mengen
                 # we vluchten van twee verschillende toestellen tot één onmogelijke rotatie.
+                # We matchen via get_flight_match_date() zodat inbound NL-vluchten op hun
+                # AMS-lokale aankomstdatum gevonden worden (niet op de US-lokale vertrekdatum).
                 csv_registration = registration
                 actual_registration = None
                 for f in target_flight_data or []:
                     if not (f and f.get('scheduled_out')): continue
-                    f_std_local = to_local(pd.to_datetime(f.get('scheduled_out')), f.get('origin', {}).get('timezone'))
-                    if f_std_local.date() == search_date and f.get('registration'):
+                    if get_flight_match_date(f) == search_date and f.get('registration'):
                         actual_registration = str(f.get('registration')).strip()
                         break
 
@@ -224,7 +256,7 @@ if uploaded_file:
                     )
                     registration = actual_registration
 
-                reg_flights = fetch_unified_data(fa_api_key, registration, search_date, search_date + timedelta(days=1))
+                reg_flights = fetch_unified_data(fa_api_key, registration, api_start, api_end)
 
                 # Filter target_flight_data zodat we alleen vluchten van het juiste toestel meenemen.
                 # Hierdoor kunnen er geen vreemde extra vluchten van andere toestellen meer in de rotatie sluipen.
@@ -264,12 +296,16 @@ if uploaded_file:
                     def _sta_utc(f):
                         return pd.to_datetime(f.get('scheduled_in'))
 
-                    # Vind de anker-vlucht: matching flight number op zoekdatum (origin local)
+                    # Vind de anker-vlucht: matching flight number op zoekdatum.
+                    # We gebruiken get_flight_match_date(): voor inbound NL-vluchten is
+                    # dat de lokale AMS-aankomstdatum, voor andere vluchten de lokale
+                    # vertrekdatum op het origin. Dit lost op dat een AMS-aankomst van
+                    # bv. DL056 op 29-03 niet gevonden werd omdat de FlightAware-vlucht
+                    # op US-tijd nog 28-03 vertrok.
                     anchor_idx = None
                     for i, f in enumerate(sorted_all):
                         if flight_digits_only and flight_digits_only in str(f.get('ident', '')):
-                            f_origin_tz = (f.get('origin') or {}).get('timezone')
-                            if to_local(_std_utc(f), f_origin_tz).date() == search_date:
+                            if get_flight_match_date(f) == search_date:
                                 anchor_idx = i
                                 break
                     # Fallback: anker zonder datumeis (eerste matching ident)
@@ -311,9 +347,10 @@ if uploaded_file:
                                 chain.append(cand); current = cand
                         sorted_flights = chain
                     else:
-                        # Geen anker; val terug op origin-lokale datumfilter zodat er nog iets te zien is.
+                        # Geen anker; val terug op lokale datumfilter via get_flight_match_date
+                        # (lokale AMS-aankomst voor inbound NL, lokale vertrek voor de rest).
                         sorted_flights = [f for f in sorted_all
-                                          if to_local(_std_utc(f), (f.get('origin') or {}).get('timezone')).date() == search_date]
+                                          if get_flight_match_date(f) == search_date]
 
                     for f in sorted_flights:
                         std = pd.to_datetime(f.get('scheduled_out'))
@@ -460,15 +497,19 @@ if uploaded_file:
                             api_ident = flight_number_clean
                             while current_dt <= end_limit:
                                 if current_dt.weekday() == search_date.weekday():
-                                    day_f = fetch_unified_data(fa_api_key, api_ident, current_dt, current_dt + timedelta(days=1))
+                                    # FIX: ook hier -1/+1 zodat inbound nachtvluchten worden gevonden
+                                    hist_start = current_dt - timedelta(days=1)
+                                    hist_end = current_dt + timedelta(days=1)
+                                    day_f = fetch_unified_data(fa_api_key, api_ident, hist_start, hist_end)
                                     valid_reg = None
                                     if day_f:
                                         for f in day_f:
+                                            if get_flight_match_date(f) != current_dt: continue
                                             dest = f.get('destination');
-                                            if dest and (dest.get('code_iata') in targets or dest.get('code_icao') in targets): 
+                                            if dest and (dest.get('code_iata') in targets or dest.get('code_icao') in targets):
                                                 valid_reg = f.get('registration'); break
                                     if valid_reg:
-                                        rotation_raw = fetch_unified_data(fa_api_key, valid_reg, current_dt, current_dt + timedelta(days=1))
+                                        rotation_raw = fetch_unified_data(fa_api_key, valid_reg, hist_start, hist_end)
                                         if rotation_raw:
                                             sample_count += 1
                                             day_T, day_F, d_rows, prev_s, prev_a = 0, 0, [], None, None
@@ -476,10 +517,10 @@ if uploaded_file:
                                             for h in hist_sorted:
                                                 h_std, h_sta = pd.to_datetime(h.get('scheduled_out')), pd.to_datetime(h.get('scheduled_in'))
                                                 h_atd, h_ata = pd.to_datetime(h.get('actual_out')), pd.to_datetime(h.get('actual_in'))
-                                                # FIX: filter op LOKALE vertrekdatum van origin, niet UTC
-                                                h_origin_tz = h.get('origin', {}).get('timezone')
-                                                h_std_local = to_local(h_std, h_origin_tz)
-                                                if h_std_local.date() != current_dt: continue
+                                                # FIX: match op lokale datum via get_flight_match_date:
+                                                # inbound NL  -> lokale AMS-aankomstdatum
+                                                # outbound NL / overig -> lokale origin-vertrekdatum
+                                                if get_flight_match_date(h) != current_dt: continue
                                                 t_s, t_a = int((h_std-prev_s).total_seconds()/60) if prev_s else 0, int((h_atd-prev_a).total_seconds()/60) if prev_a and h_atd else 0
                                                 t_loss = max(0, (t_a - t_s)) if prev_s and prev_a else 0
                                                 f_loss = max(0, (int((h_ata-h_atd).total_seconds()/60) - int((h_sta-h_std).total_seconds()/60))) if h_sta and h_ata and h_atd else 0
